@@ -685,13 +685,13 @@ class StableDiffusionTrainer:
                     else:
                         self.report_idx += 1
                     if self.report_idx % 100 == 0:
-                        self.run.log(logs, step=self.global_step)
+                        self.run.log(self.logs, step=self.global_step)
                     if self.report_idx % 1000 == 0:
                         print(f"\nLOSS: {ema_loss} {get_gpu_ram()}", file=sys.stderr)
                         sys.stderr.flush()
 
                     self.progress_bar.update(1)
-                    self.progress_bar.set_postfix(**logs)
+                    self.progress_bar.set_postfix(**self.logs)
 
                     if self.global_step % args.save_steps == 0:
                         self.save_checkpoint()
