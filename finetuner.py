@@ -12,7 +12,7 @@ import math
 import psutil
 import pynvml
 import sys
-import wandb
+import json
 import gc
 import accelerate
 import pickle
@@ -44,8 +44,6 @@ from torch.optim import Optimizer
 # Latent Scale Factor - https://github.com/huggingface/diffusers/issues/437
 L_SCALE_FACTOR = 0.18215
 
-# defaults should be good for everyone
-bool_t = lambda x: (str(x).lower() in ["true", "1", "t", "y", "yes"])
 parser = argparse.ArgumentParser(description="Stable Diffusion Finetuner")
 parser.add_argument(
     "--model",
@@ -74,7 +72,7 @@ parser.add_argument(
 )
 parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
 parser.add_argument(
-    "--use_ema", type=bool_t, default="False", help="Use EMA for finetuning"
+    "--use_ema", action="store_true", default=False, help="Use EMA for finetuning"
 )
 parser.add_argument(
     "--ucg",
@@ -91,15 +89,13 @@ parser.add_argument(
 parser.add_argument(
     "--gradient_checkpointing",
     dest="gradient_checkpointing",
-    type=bool_t,
-    default="False",
+    action="store_true", default=False, 
     help="Enable gradient checkpointing",
 )
 parser.add_argument(
     "--use_8bit_adam",
     dest="use_8bit_adam",
-    type=bool_t,
-    default="False",
+    action="store_true", default=False, 
     help="Use 8-bit Adam optimizer",
 )
 parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
@@ -139,28 +135,26 @@ parser.add_argument(
 parser.add_argument(
     "--shuffle",
     dest="shuffle",
-    type=bool_t,
-    default="True",
+    type=bool,
+    default=True,
     help="Shuffle dataset",
+)
+parser.add_argument(
+    "--reshuffle_tags",
+    action="store_true",
+    help="reshuffle tags after dropping out from the end."
 )
 parser.add_argument(
     "--hf_token",
     type=str,
-    default=None,
+    default="x",
     required=False,
     help="A HuggingFace token is needed to download private models for training.",
 )
 parser.add_argument(
-    "--project_id",
-    type=str,
-    default="diffusers",
-    help="Project ID for reporting to WandB",
-)
-parser.add_argument(
     "--fp16",
     dest="fp16",
-    type=bool_t,
-    default="False",
+    action="store_true", default=False, 
     help="Train in mixed precision",
 )
 parser.add_argument(
@@ -203,13 +197,10 @@ parser.add_argument(
 parser.add_argument(
     "--lr_max_scale", type=float, default=1.0, help="Maximum scaling factor for cosine_with_restarts lr scheduler."
 )
-parser.add_argument('--use_xformers', type=bool_t, default='False', help='Use memory efficient attention')
+parser.add_argument('--use_xformers', action="store_true", default=False, help='Use memory efficient attention')
 parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
 parser.add_argument('--extended_mode_chunks', type=int, default=0, help='Enables extended mode for tokenization with given amount of maximum chunks. Values < 2 disable.')
 parser.add_argument('--clip_penultimate', action="store_true", default=False, help='Use penultimate CLIP layer for text embedding')
-parser.add_argument(
-    "--caption_log_steps", type=int, default=0, help="Number of steps to log captions, 0 disables"
-)
 args = parser.parse_args()
 
 
@@ -387,16 +378,33 @@ class StableDiffusionTrainer:
                 range(args.epochs * len(self.train_dataloader)),
                 desc="Total Steps",
                 leave=False,
+                dynamic_ncols=True,
+                smoothing=min(.3,  20.0 / len(self.train_dataloader))
             )
-        self.run = wandb.init(
-            project=args.project_id,
-            name=f"{args.run_name}-p{accelerator.local_process_index}",
-            config={
-                k: v for k, v in vars(args).items() if k not in ["hf_token"]
-            },
-            dir=args.output_path + "/wandb",
-            group=f"{args.run_name}-group"
-        )
+
+        class Logger:
+            def __init__(self, filepath):
+                self.file = open(filepath + "/run_training_log.txt", "w")
+                self.filepath = filepath
+
+            def log(self, data, step=None):
+                index = 0
+                if "images" in data.keys():
+                    os.makedirs(f"{self.filepath}/images/step_{step}", exist_ok=True)
+                    for image, caption in data["images"]:
+                        image.save(f"{self.filepath}/images/step_{step}/sample_{caption.replace(' ', '_')[:35]}_{index}.png","PNG")
+                        index += 1
+                else:
+                    self.file.write(f"[step {step}]: " if step else "[log]: ")
+                    self.file.write(json.dumps(data))
+                    self.file.write('\n')
+                    self.file.flush()
+            
+            def close(self):
+                self.file.close()
+                self.file = None
+
+        self.run = Logger(args.output_path)
         self.global_step = 0
 
     def save_checkpoint(self):
@@ -455,7 +463,7 @@ class StableDiffusionTrainer:
             with torch.autocast("cuda", enabled=args.fp16):
                 for _ in range(args.image_log_amount):
                     images.append(
-                        wandb.Image(pipeline(prompt).images[0], caption=prompt)
+                        (pipeline(prompt).images[0], prompt)
                     )
         # log images under single caption
         self.run.log({"images": images}, step=self.global_step)
@@ -527,6 +535,19 @@ class StableDiffusionTrainer:
                     input_ids = text_encoder(torch.asarray(input_ids).to(self.accelerator.device), output_hidden_states=True, attention_mask=torch.asarray(attn).to(self.accelerator.device)).last_hidden_state
         return torch.stack(tuple(input_ids))
 
+    def backprop(self, loss):
+        self.accelerator.backward(loss)
+        if self.accelerator.sync_gradients:
+            params_to_clip = (
+                itertools.chain(self.unet.parameters(), self.text_encoder.parameters())
+                if args.train_text_encoder
+                else self.unet.parameters()
+            )
+            self.accelerator.clip_grad_norm_(params_to_clip, 1.0)
+        self.optimizer.step()
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
+
     def sub_step(self, batch: dict, epoch: int) -> torch.Tensor:
         # Load our network-streamed latents
         latents = list(map(lambda x: torch.load(io.BytesIO(x)), batch["latents"]))
@@ -544,11 +565,6 @@ class StableDiffusionTrainer:
             if l.size() != latents[largest_latent].size():
                 print(
                     f'ERROR: Uneven latent size found at step {self.global_step} ({l.size()} -> {latents[largest_latent].size()})! Replacing...'
-                )
-                self.run.alert(
-                    title="Uneven Latent Size",
-                    text=f"Step: {self.global_step} ({l.size()} -> {latents[largest_latent].size()})",
-                    level=wandb.AlertLevel.WARN
                 )
 
                 latents[idx] = latents[largest_latent].clone()
@@ -598,22 +614,7 @@ class StableDiffusionTrainer:
             noise_pred.float(), target.float(), reduction="mean"
         )
 
-        # Backprop
-        self.accelerator.backward(loss)
-        if self.accelerator.sync_gradients:
-            params_to_clip = (
-                itertools.chain(self.unet.parameters(), self.text_encoder.parameters())
-                if args.train_text_encoder
-                else self.unet.parameters()
-            )
-            self.accelerator.clip_grad_norm_(params_to_clip, 1.0)
-        self.optimizer.step()
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
-
-        self.run.log({
-            "rank/loss": loss.detach().item()
-        }, step=self.global_step)
+        self.backprop(loss)
 
         del latents
         return self.accelerator.gather_for_metrics(loss).mean()
@@ -632,6 +633,8 @@ class StableDiffusionTrainer:
         }
 
     def train(self) -> None:
+        self.logs = {"train/loss": 0.33}
+        ema_loss_decay = min(1,  20.0 / len(self.train_dataloader))
         for epoch in range(args.epochs):
             self.unet.train()
             if args.train_text_encoder:
@@ -652,20 +655,6 @@ class StableDiffusionTrainer:
 
                 self.global_step += 1
 
-                if args.caption_log_steps > 0 and self.global_step % args.caption_log_steps == 0:
-                    self.captions_table_labels = ['step']
-                    for key in batch:
-                        if key != 'latents' and key != 'captions':
-                            self.captions_table_labels.append(key)
-                    self.captions_table_labels.append('captions')
-                    self.captions_table = wandb.Table(columns=self.captions_table_labels)
-                    for i in range(len(batch["captions"])):
-                        caption_data = [self.global_step]
-                        for key in self.captions_table_labels[1:]:
-                            caption_data.append(batch[key][i])
-                        self.captions_table.add_data(*caption_data)
-                    self.run.log({"rank/captions": self.captions_table}, step=self.global_step)
-
                 if self.accelerator.is_main_process:
                     rank_samples_per_second = args.batch_size * (
                         1 / (time.perf_counter() - step_start)
@@ -675,13 +664,20 @@ class StableDiffusionTrainer:
                     )
                     logs.update(
                         {
-                            "perf/rank_samples_per_second": rank_samples_per_second,
-                            "perf/world_samples_per_second": world_samples_per_second,
+                            "perf/rank_sps": rank_samples_per_second,
+                            "perf/world_sps": world_samples_per_second,
                             "train/epoch": epoch,
                             "train/step": self.global_step,
                             "train/samples_seen": self.global_step * self.accelerator.num_processes * args.batch_size,
                         }
                     )
+                    #smooth loss over 5% of an epoch
+                    
+                    ema_loss = self.logs['train/loss'] *  (1 - ema_loss_decay) + logs['train/loss'] * ema_loss_decay
+                    self.logs.update(
+                        logs
+                    )
+                    self.logs['train/loss'] = ema_loss
 
                     # Output GPU RAM to flush tqdm
                     if not hasattr(self, 'report_idx'):
@@ -689,13 +685,13 @@ class StableDiffusionTrainer:
                     else:
                         self.report_idx += 1
                     if self.report_idx % 100 == 0:
-                        print(f"\nLOSS: {logs['train/loss']} {get_gpu_ram()}", file=sys.stderr)
+                        self.run.log(logs, step=self.global_step)
+                    if self.report_idx % 1000 == 0:
+                        print(f"\nLOSS: {ema_loss} {get_gpu_ram()}", file=sys.stderr)
                         sys.stderr.flush()
 
                     self.progress_bar.update(1)
                     self.progress_bar.set_postfix(**logs)
-
-                    self.run.log(logs, step=self.global_step)
 
                     if self.global_step % args.save_steps == 0:
                         self.save_checkpoint()
@@ -710,6 +706,7 @@ class StableDiffusionTrainer:
 
         self.accelerator.wait_for_everyone()
         self.save_checkpoint()
+        self.run.close()
 
 def get_cosine_with_hard_restarts_schedule_with_warmup_and_scaling(
     optimizer: Optimizer,
@@ -825,6 +822,14 @@ def main() -> None:
         args.model, subfolder="scheduler", use_auth_token=args.hf_token
     )
 
+    def reshuffle(data):
+        if args.reshuffle_tags:
+            copy_data = []
+            copy_data[:] = data
+            random.shuffle(copy_data)
+            return copy_data
+        return data
+
     def drop_random(data):
         if random.random() > args.ucg:
             if args.partial_dropout:
@@ -832,10 +837,10 @@ def main() -> None:
                 # to keep a random percent of the data, where the random number is the x-axis
                 x = random.randint(0, 100)
                 if x >= 50:
-                    return ', '.join(data)
+                    return ', '.join(reshuffle(data))
                 else:
-                    return ', '.join(data[:len(data) * x * 2 // 100])
-            return ', '.join(data)
+                    return ', '.join(reshuffle(data[:len(data) * x * 2 // 100]))
+            return ', '.join(reshuffle(data))
         else:
             # drop for unconditional guidance
             return ''
@@ -869,11 +874,12 @@ def main() -> None:
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_sampler=sampler,
-        num_workers=30,
+        num_workers=10,
         collate_fn=collate_fn
     )
 
     if args.lr_scheduler == 'cosine_with_restarts':
+        print("lr scheduler = cosine with restarts")
         lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup_and_scaling(
             optimizer=optimizer,
             num_warmup_steps=args.lr_warmup_steps,
@@ -883,6 +889,7 @@ def main() -> None:
             min_scale=args.lr_min_scale
         )
     else:
+        print(f"lr scheduler = {args.lr_scheduler}")
         lr_scheduler = get_scheduler(
             args.lr_scheduler,
             optimizer=optimizer,
