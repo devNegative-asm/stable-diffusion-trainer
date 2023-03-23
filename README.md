@@ -1,3 +1,5 @@
+Stable diffusion trainer based on https://github.com/waifu-diffusion/network-trainer
+
 Steps
 1. Create your aspect buckets with `create-aspect.py`
 2. Create your config.json with keys: 
