@@ -206,7 +206,7 @@ parser.add_argument(
 )
 parser.add_argument('--use_xformers', action="store_true", default=False, help='Use memory efficient attention')
 parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
-parser.add_argument("--text_encoder_learning_rate", type=int, default=1.8e-8, help="Learning rate for the text encoder")
+parser.add_argument("--text_encoder_learning_rate", type=float, default=1.8e-8, help="Learning rate for the text encoder")
 parser.add_argument('--extended_mode_chunks', type=int, default=0, help='Enables extended mode for tokenization with given amount of maximum chunks. Values < 2 disable.')
 parser.add_argument('--clip_penultimate', action="store_true", default=False, help='Use penultimate CLIP layer for text embedding')
 parser.add_argument('--log_loss_ema', action="store_true", default=False, help='Smooth logged loss using EMA')
