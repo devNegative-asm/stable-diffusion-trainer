@@ -13,5 +13,7 @@ Steps
 
 Example fine tuning command:
 ```
-SD_TRAINER_CONFIG_FILE=config.json python finetuner.py --model ../model/sd2_1 --run_name "test" --dataset buckets.pt --lr 1e-6 --epochs 1 --use_ema --ucg 0.01 --use_8bit_adam --save_steps 4500 --reshuffle_tags --image_log_steps 500 --image_log_amount 3 --lr_scheduler cosine_with_restarts --lr_num_cycles 5 --lr_min_scale 0.2 --use_xformers --train_text_encoder --extended_mode_chunks 3 --clip_penultimate
+SD_TRAINER_CONFIG_FILE=config.json python finetuner.py --model ../model/sd2_1 --run_name "test" --dataset buckets.pt --lr 1e-6 --epochs 1 --ucg 0.01 --use_8bit_adam --save_steps 4500 --reshuffle_tags --image_log_steps 500 --image_log_amount 3 --lr_scheduler cosine_with_restarts --lr_num_cycles 5 --lr_min_scale 0.2 --use_xformers --train_text_encoder --extended_mode_chunks 3
 ```
+
+To find the date this code was last edited, check the commit log on github.

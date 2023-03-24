@@ -21,12 +21,13 @@ import copy
 import numpy as np
 import io
 from connector.store import AspectBucket, AspectDataset, AspectBucketSampler
-
+from contextlib import redirect_stdout
 try:
     pynvml.nvmlInit()
 except pynvml.nvml.NVMLError_LibraryNotFound:
     pynvml = None
 
+from PIL.PngImagePlugin import PngInfo
 from typing import Iterable, Optional
 from diffusers import (
     AutoencoderKL,
@@ -186,6 +187,12 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--sample_prompt", default=None, help="prompt to use when generating samples"
+)
+parser.add_argument(
+    "--uncond_sample_prompt", default=None, help="prompt to use when generating samples after a batch that used UCG"
+)
+parser.add_argument(
     "--lr_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
 )
 parser.add_argument(
@@ -199,8 +206,10 @@ parser.add_argument(
 )
 parser.add_argument('--use_xformers', action="store_true", default=False, help='Use memory efficient attention')
 parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
+parser.add_argument("--text_encoder_learning_rate", type=int, default=1.8e-8, help="Learning rate for the text encoder")
 parser.add_argument('--extended_mode_chunks', type=int, default=0, help='Enables extended mode for tokenization with given amount of maximum chunks. Values < 2 disable.')
 parser.add_argument('--clip_penultimate', action="store_true", default=False, help='Use penultimate CLIP layer for text embedding')
+parser.add_argument('--log_loss_ema', action="store_true", default=False, help='Smooth logged loss using EMA')
 args = parser.parse_args()
 
 
@@ -384,15 +393,20 @@ class StableDiffusionTrainer:
 
         class Logger:
             def __init__(self, filepath):
-                self.file = open(filepath + "/run_training_log.txt", "w")
+                self.file = open(os.path.join(filepath ,"run_training_log.txt"), "w")
                 self.filepath = filepath
 
             def log(self, data, step=None):
                 index = 0
                 if "images" in data.keys():
-                    os.makedirs(f"{self.filepath}/images/step_{step}", exist_ok=True)
+                    os.makedirs(os.path.join(self.filepath, args.run_name, 'images', f"step_{step}"), exist_ok=True)
                     for image, caption in data["images"]:
-                        image.save(f"{self.filepath}/images/step_{step}/sample_{caption.replace(' ', '_')[:35]}_{index}.png","PNG")
+                        metadata = PngInfo()
+                        metadata.add_text("SD_TRAINING_RUN", args.run_name)
+                        metadata.add_text("SD_PROMPT", caption)
+                        metadata.add_text("SD_STEP_NUMBER", str(step))
+
+                        image.save(os.path.join(self.filepath, args.run_name, 'images', f"step_{step}", f"sample_{index}.png"),"PNG", pnginfo=metadata)
                         index += 1
                 else:
                     self.file.write(f"[step {step}]: " if step else "[log]: ")
@@ -432,7 +446,7 @@ class StableDiffusionTrainer:
             ),
         )
         print(f'Saving model (step: {self.global_step})...')
-        pipeline.save_pretrained(os.path.join(args.output_path, 'step_' + str(self.global_step)), safe_serialization=True)
+        pipeline.save_pretrained(os.path.join(args.output_path, args.run_name, "checkpoints", 'step_' + str(self.global_step)), safe_serialization=True)
         if args.use_ema:
             self.ema.restore(unet.parameters())
         del pipeline
@@ -458,15 +472,12 @@ class StableDiffusionTrainer:
             ),
         ).to(self.accelerator.device)
         # inference
-        images = []
         with torch.no_grad():
             with torch.autocast("cuda", enabled=args.fp16):
-                for _ in range(args.image_log_amount):
-                    images.append(
-                        (pipeline(prompt).images[0], prompt)
-                    )
-        # log images under single caption
-        self.run.log({"images": images}, step=self.global_step)
+                with redirect_stdout(None):
+                    images = ((pipeline(prompt).images[0], prompt) for _ in range(args.image_log_amount))
+                    # log images under single caption
+                    self.run.log({"images": images}, step=self.global_step)
 
         # cleanup so we don't run out of memory
         del pipeline
@@ -635,6 +646,8 @@ class StableDiffusionTrainer:
     def train(self) -> None:
         self.logs = {"train/loss": 0.33}
         ema_loss_decay = min(1,  20.0 / len(self.train_dataloader))
+        if not args.log_loss_ema:
+            ema_loss_decay = 1
         for epoch in range(args.epochs):
             self.unet.train()
             if args.train_text_encoder:
@@ -684,7 +697,7 @@ class StableDiffusionTrainer:
                         self.report_idx = 1
                     else:
                         self.report_idx += 1
-                    if self.report_idx % 100 == 0:
+                    if self.report_idx % 10 == 0:
                         self.run.log(self.logs, step=self.global_step)
                     if self.report_idx % 1000 == 0:
                         print(f"\nLOSS: {ema_loss} {get_gpu_ram()}", file=sys.stderr)
@@ -697,7 +710,12 @@ class StableDiffusionTrainer:
                         self.save_checkpoint()
 
                     if self.global_step % args.image_log_steps == 0:
-                        prompt = batch["captions"][random.randint(0, len(batch["captions"]) - 1)]
+                        if args.sample_prompt==None:
+                            prompt = batch["captions"][random.randint(0, len(batch["captions"]) - 1)]
+                            if(len(prompt) == 0 and args.uncond_sample_prompt):
+                                prompt = args.uncond_sample_prompt
+                        else:
+                            prompt = args.sample_prompt
                         self.sample(prompt)
 
                 del batch["captions"]
@@ -752,7 +770,7 @@ def main() -> None:
     accelerate.utils.set_seed(args.seed)
 
     if accelerator.is_main_process:
-        os.makedirs(args.output_path, exist_ok=True)
+        os.makedirs(os.path.join(args.output_path, args.run_name, "checkpoints"), exist_ok=True)
         # Inform the user of host, and various versions -- useful for debugging issues.
         print("RUN_NAME:", args.run_name)
         print("HOST:", socket.gethostname())
@@ -811,7 +829,10 @@ def main() -> None:
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        unet.parameters() if not args.train_text_encoder else itertools.chain(unet.parameters(), text_encoder.parameters()),
+        unet.parameters() if not args.train_text_encoder else [
+            {"params": unet.parameters()},
+            {"params": text_encoder.parameters(), "lr": args.text_encoder_learning_rate}
+        ],
         lr=args.lr,
         betas=(args.adam_beta1, args.adam_beta2),
         eps=args.adam_epsilon,

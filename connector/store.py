@@ -71,7 +71,7 @@ def generate_images() -> Generator[Tuple[str, str, float], None, None]:
 class ImageStore:
     def __init__(self) -> None:
         self.image_files = []
-        self.image_files.extend(generate_images())
+        self.image_files.extend(tqdm.tqdm(generate_images(), total=len(all_image_files)))
 
     def __len__(self) -> int:
         return len(self.image_files)
