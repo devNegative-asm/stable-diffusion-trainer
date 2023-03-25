@@ -21,7 +21,6 @@ import copy
 import numpy as np
 import io
 from connector.store import AspectBucket, AspectDataset, AspectBucketSampler
-from contextlib import redirect_stdout
 try:
     pynvml.nvmlInit()
 except pynvml.nvml.NVMLError_LibraryNotFound:
@@ -67,7 +66,7 @@ parser.add_argument(
     required=True,
     help="The path to the pickled data file to use for finetuning.",
 )
-parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
+parser.add_argument("--lr", type=float, default=5e-7, help="Learning rate")
 parser.add_argument(
     "--epochs", type=int, default=10, help="Number of epochs to train for"
 )
@@ -206,10 +205,11 @@ parser.add_argument(
 )
 parser.add_argument('--use_xformers', action="store_true", default=False, help='Use memory efficient attention')
 parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
-parser.add_argument("--text_encoder_learning_rate", type=float, default=1.8e-8, help="Learning rate for the text encoder")
+parser.add_argument("--text_encoder_learning_rate", type=float, default=7e-9, help="Learning rate for the text encoder")
 parser.add_argument('--extended_mode_chunks', type=int, default=0, help='Enables extended mode for tokenization with given amount of maximum chunks. Values < 2 disable.')
 parser.add_argument('--clip_penultimate', action="store_true", default=False, help='Use penultimate CLIP layer for text embedding')
 parser.add_argument('--log_loss_ema', action="store_true", default=False, help='Smooth logged loss using EMA')
+parser.add_argument('--chunked_tag_shuffle', type=int, default=0, help='shuffle the first n tags within the first n tags, and shuffle the trailing tags with each other.')
 args = parser.parse_args()
 
 
@@ -457,6 +457,10 @@ class StableDiffusionTrainer:
         text_encoder = self.text_encoder
         if args.train_text_encoder:
             text_encoder = self.accelerator.unwrap_model(self.text_encoder)
+
+        def fake_safety_checker(clip_input, images):
+            return images, []
+
         pipeline = StableDiffusionPipeline(
             text_encoder=text_encoder,
             vae=self.vae,
@@ -466,7 +470,7 @@ class StableDiffusionTrainer:
                 self.args.model,
                 subfolder="scheduler",
             ),
-            safety_checker=None,  # display safety checker to save memory
+            safety_checker=fake_safety_checker,  # don't load the real safety checker to save memory
             feature_extractor=CLIPFeatureExtractor.from_pretrained(
                 "openai/clip-vit-base-patch32"
             ),
@@ -474,10 +478,9 @@ class StableDiffusionTrainer:
         # inference
         with torch.no_grad():
             with torch.autocast("cuda", enabled=args.fp16):
-                with redirect_stdout(None):
-                    images = ((pipeline(prompt).images[0], prompt) for _ in range(args.image_log_amount))
-                    # log images under single caption
-                    self.run.log({"images": images}, step=self.global_step)
+                images = ((pipeline(prompt).images[0], prompt) for _ in range(args.image_log_amount))
+                # log images under single caption
+                self.run.log({"images": images}, step=self.global_step)
 
         # cleanup so we don't run out of memory
         del pipeline
@@ -549,12 +552,11 @@ class StableDiffusionTrainer:
     def backprop(self, loss):
         self.accelerator.backward(loss)
         if self.accelerator.sync_gradients:
-            params_to_clip = (
-                itertools.chain(self.unet.parameters(), self.text_encoder.parameters())
-                if args.train_text_encoder
-                else self.unet.parameters()
-            )
-            self.accelerator.clip_grad_norm_(params_to_clip, 1.0)
+            if args.train_text_encoder:
+                self.accelerator.clip_grad_norm_(self.unet.parameters(), .7071)
+                self.accelerator.clip_grad_norm_(self.text_encoder.parameters(), .7071)
+            else:
+                self.accelerator.clip_grad_norm_(self.unet.parameters(), 1.0)
         self.optimizer.step()
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
@@ -845,10 +847,17 @@ def main() -> None:
 
     def reshuffle(data):
         if args.reshuffle_tags:
-            copy_data = []
-            copy_data[:] = data
-            random.shuffle(copy_data)
-            return copy_data
+            if args.chunked_tag_shuffle==0:
+                copy_data = []
+                copy_data[:] = data
+                random.shuffle(copy_data)
+                return copy_data
+            else:
+                d_head = data[:args.chunked_tag_shuffle]
+                d_tail = data[args.chunked_tag_shuffle:]
+                random.shuffle(d_head)
+                random.shuffle(d_tail)
+                return d_head + d_tail
         return data
 
     def drop_random(data):
