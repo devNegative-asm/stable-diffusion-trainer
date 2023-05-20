@@ -459,7 +459,7 @@ class StableDiffusionTrainer:
             text_encoder = self.accelerator.unwrap_model(self.text_encoder)
 
         def fake_safety_checker(clip_input, images):
-            return images, []
+            return images, None
 
         pipeline = StableDiffusionPipeline(
             text_encoder=text_encoder,
